@@ -9,32 +9,27 @@ from pox.lib.recoco import Timer
 
 log = core.getLogger()
 
-# --------------------------------------------------------------------------
-# Tunables
-# --------------------------------------------------------------------------
-POLL_INTERVAL   = 2       # s  - how often we pull flow stats (for Dv)
-REPORT_INTERVAL = 20      # s  - how often we print the spine distribution
-IDLE_TIMEOUT    = 10      # s  - a finished connection expires this long after
-HARD_TIMEOUT    = 120     # s    its last byte -> we read its final Dv then
-MIN_ROUND_GAP   = 5       # s  - connections closer than this = SAME round
-                          #      (filters iperf's control+data double connect)
-DV_MIN          = 500000  # bytes - ignore tiny control/ACK connections for Dv
-# "balanced" = load-aware ECMP driven by the training identity (Kv);
-# "single"   = force every flow onto ONE spine  (baseline for comparison).
-# This is only the STARTING mode: _report_distribution watches the spine
-# split and auto-promotes self.routing_mode "single" -> "balanced" the
-# first time it detects congestion (see UNEVEN_RATIO below).
-ROUTING_MODE    = "single"  # "balanced" or "single"
+POLL_INTERVAL   = 2       # statistiche flusso 
+REPORT_INTERVAL = 20      # distribuzione del carico tra gli spine
+IDLE_TIMEOUT    = 10      # terminazione della regola se non ci sono pacchetti per 10s
+HARD_TIMEOUT    = 120     # ultimo byte di un flusso -> termina la regola dopo 120s
+MIN_ROUND_GAP   = 5       # conns con lo stesso sport entro 5s -> stesso round
+DV_MIN          = 500000  # ignora le piccole connessioni di controllo/ACK per Dv
+#_report_distribution monitora la divisione dello spine
+# e promuove automaticamente self.routing_mode da "single" -> "balanced"
+ROUTING_MODE    = "single"  #forza ogni flusso su un solo spine (baseline per confronto).
 UNEVEN_RATIO    = 1.25   # max/min spine-load ratio above which we call it "uneven"
 
 
 class MLRoutingApp(object):
+    #teoria degli eventi di POX
     def __init__(self):
         core.openflow.addListeners(self)
         core.openflow_discovery.addListeners(self)
+        #topologia switch-switch e switch-host
         self.graph = {}               # dpid -> {neighbor_dpid: out_port}
         self.mac_to_location = {}      # mac  -> (dpid, port)
-
+        
         self.collectors = {
             IPAddr("10.0.1.1"): "blue",
             IPAddr("10.0.1.2"): "green",
@@ -42,37 +37,33 @@ class MLRoutingApp(object):
             IPAddr("10.0.1.4"): "yellow",
         }
 
-        # --- discovery / control state -------------------------------------
+        # discovery / control state 
         self.active_workers   = {v: set() for v in self.collectors.values()}
         self.training_start_t = {v: None  for v in self.collectors.values()}
         self.spine_load       = {v: defaultdict(int) for v in self.collectors.values()}
-        self.global_start     = None    # time the very first worker was seen
+        self.global_start     = None    # tempo in cui il primo worker è stato visto (per calcolare phi_v)
 
-        # --- reactive routing state ------------------------------------------
-        self.routing_mode = ROUTING_MODE   # mutable copy; _report_distribution may flip it
+        # reactive routing state 
+        self.routing_mode = ROUTING_MODE   # può cambiare runtime se si rileva congestione
 
-        # --- traffic-characterization state (connection based) -------------
-        self.worker_training  = {}               # worker_ip -> training name
-        self.conn_seen        = set()            # (worker_ip, tcp_src_port) already counted
-        self.round_start      = {}               # worker_ip -> time its last round began
-        self.first_round_start = {}              # worker_ip -> time of its very first round
-        self.round_count      = defaultdict(int)
-        self.Tv_samples       = defaultdict(list) # worker_ip -> [inter-round gaps]
+        # traffic-characterization state 
+        self.worker_training  = {}               # worker_ip -> nome del training
+        self.conn_seen        = set()            # insieme delle coppie (worker_ip, tcp_src_port) processate almeno una volta
+        self.round_start      = {}               # worker_ip -> timestamp dell'ultimo round iniziato per quel worker
+        self.first_round_start = {}              # worker_ip -> timestamp del primo round, mai più modificato
+        self.round_count      = defaultdict(int) # worker_ip → quanti round ha completato finora quel worker
+        self.Tv_samples       = defaultdict(list) # worker_ip -> [inter-round gaps] lista scarti temporali tra round successivi (per calcolare Tv)
         self.phi              = {}               # worker_ip -> phase offset
-        # Per-dpid tracking: a connection is "done" only when it has vanished from
-        # ALL switches that previously confirmed its existence.  Without this, the
-        # spine that does NOT carry a given flow sees it as absent on every poll and
-        # fires false "done" events, which reports Dv too early (Tv_samples still empty).
-        self.conn_dpids       = defaultdict(set)  # (wip, sport) -> set of dpids with rule
-        self.conn_bytes       = {}                 # (wip, sport) -> max byte_count seen
+        self.conn_dpids       = defaultdict(set)  # (wip, sport) -> insieme di dpid degli switch che hanno confermato che quel flusso è ancora vivo
+        self.conn_bytes       = {}                 # (wip, sport) -> byte_count più alto osseravto
 
         Timer(POLL_INTERVAL,   self._request_stats,       recurring=True)
         Timer(REPORT_INTERVAL, self._report_distribution, recurring=True)
         log.info("ML Routing up  |  starting mode=%s", self.routing_mode)
 
-    # ======================================================================
-    # Topology bookkeeping
-    # ======================================================================
+     # Contabilità della topologia
+    
+    # quando uno switch stabilisce il canale di controllo col controller
     def _handle_ConnectionUp(self, event):
         self.graph.setdefault(event.dpid, {})
         msg = of.ofp_flow_mod()
@@ -80,7 +71,7 @@ class MLRoutingApp(object):
         msg.command = of.OFPFC_DELETE
         event.connection.send(msg)
         log.info("Switch connected: %s", dpid_to_str(event.dpid))
-
+    #ogni link scoperto aggiorna il grafo in entrambe le direzioni
     def _handle_LinkEvent(self, event):
         lk = event.link
         if event.added:
@@ -95,9 +86,8 @@ class MLRoutingApp(object):
         # spines reach every leaf (degree > 2); leaves reach only the 2 spines.
         return len(self.graph.get(dpid, {})) > 2
 
-    # ======================================================================
-    # Path computation
-    # ======================================================================
+    # Calcolo dei cammini 
+    #BFS
     def _all_shortest_paths(self, src, dst):
         if src == dst:
             return [[src]]
@@ -123,7 +113,7 @@ class MLRoutingApp(object):
             if self._is_spine(n):
                 return n
         return None
-
+    # funzione di decisione del percorso da prendere tra i cammini a costo uguale
     def _pick_path(self, src, dst, training, key):
         """Choose one equal-cost path.
 
@@ -157,13 +147,8 @@ class MLRoutingApp(object):
                 best = (l, spine, path)
         return best[2], best[1]
 
-    # ======================================================================
-    # Traffic characterization  (Kv, Dv, Tv, phi_v)
-    # ----------------------------------------------------------------------
-    #  Kv       : number of distinct workers seen for the training (PacketIn)
-    #  Tv, phi  : from NEW connections (each round = new TCP src port -> PacketIn)
-    #  Dv       : final byte_count of a completed connection (~ D per round)
-    # ======================================================================
+    # Caratterizzazione del traffico 
+    # ogni round di iperf3 apre una connessione TCP nuova
     def _note_connection(self, training, wip, sport):
         """Called on the first packet of a worker->collector flow."""
         key = (wip, sport)
@@ -189,11 +174,11 @@ class MLRoutingApp(object):
         else:
             log.debug("[DBG] %s sport=%d  SAME round (gap=%.3fs < %ds)",
                       wip, sport, now - last, MIN_ROUND_GAP)
-
+    #richiesta di statistiche di flusso
     def _request_stats(self):
         for c in core.openflow.connections:
             c.send(of.ofp_stats_request(body=of.ofp_flow_stats_request()))
-
+    #filtra le statistiche ai soli flussi TCP/IPv4 diretti a un collector noto
     def _handle_FlowStatsReceived(self, event):
         dpid = event.connection.dpid
         here = set()
@@ -208,22 +193,22 @@ class MLRoutingApp(object):
             key = (wip, m.tp_src)
             here.add(key)
             self.conn_dpids[key].add(dpid)
-            # keep the largest byte_count seen across all switches for this flow
+            # aggiorna il byte_count più alto osservato per questo flusso
             if stat.byte_count > self.conn_bytes.get(key, 0):
                 self.conn_bytes[key] = stat.byte_count
             self.worker_training[wip] = self.collectors[m.nw_dst]
 
-        # Flows THIS switch previously had but no longer reports -> rule expired here.
+        # flussi che questo switch segnalava prima ma non più
         # Only fire "done" when the flow has disappeared from ALL switches that had it.
         for key in list(self.conn_dpids):
             if dpid not in self.conn_dpids[key]:
-                continue         # this switch never had the flow, skip
+                continue         # questo switch non lo ha mai avuto, salta
             if key in here:
-                continue         # still alive on this switch
+                continue          #ancora vivo su questo switch
             self.conn_dpids[key].discard(dpid)
             if self.conn_dpids[key]:
-                continue         # still alive on at least one other switch
-            # Gone from every switch that had it -> connection finished
+                continue         # ancora vivo su almeno un altro switch
+            # connessione conclusa (sparito da ogni switch che l'aveva)
             dv = self.conn_bytes.pop(key, 0)
             del self.conn_dpids[key]
             if dv < DV_MIN:
@@ -233,10 +218,10 @@ class MLRoutingApp(object):
             if training is None:
                 continue
             rc = self.round_count[wip]
-            # Primary Tv: mean of per-interval samples collected by _note_connection
+            # Tv principale: media dei campioni raccolti da _note_connection
             Tv = (sum(self.Tv_samples[wip]) / len(self.Tv_samples[wip])
                   if self.Tv_samples[wip] else None)
-            # Fallback Tv: total span / number of intervals (more robust)
+            ## Tv di riserva: durata totale / numero di intervalli
             if Tv is None and rc >= 2 and wip in self.first_round_start:
                 Tv = ((self.round_start[wip] - self.first_round_start[wip])
                       / (rc - 1))
@@ -248,7 +233,7 @@ class MLRoutingApp(object):
                      "%.1fs" % Tv if Tv else "?",
                      self.phi.get(wip, 0.0),
                      rc)
-
+    
     def _report_distribution(self):
         congested = False
         for t, load in self.spine_load.items():
@@ -271,15 +256,14 @@ class MLRoutingApp(object):
                     congested = True
             log.info("[%s] Kv=%d | %s | %s", t.upper(), kv, parts, status)
 
-        # Reactive control: self-heal out of "single" once real imbalance is seen.
+        # auto-risparatore da single se rilevato uno squilibrio
         if congested and self.routing_mode == "single":
             self.routing_mode = "balanced"
             log.warning("[AUTO] congestion detected -> switching ROUTING_MODE "
                         "'single' -> 'balanced'")
 
-    # ======================================================================
     # Forwarding
-    # ======================================================================
+    #MAC learning passivo
     def _handle_PacketIn(self, event):
         pkt = event.parsed
         if not pkt.parsed:
@@ -291,11 +275,11 @@ class MLRoutingApp(object):
                       for nb in self.graph.get(dpid, {}))
         if not sw_link and not src_mac.is_multicast:
             self.mac_to_location[src_mac] = (dpid, in_port)
-
+        #metodo di navigazione dei pacchetti incapsulati di POX
         ip4 = pkt.find("ipv4")
         tcp = pkt.find("tcp") if ip4 else None
 
-        # ---- worker discovery + round detection --------------------------
+        # scoperta dei worker e rilevamento dei round
         if ip4 and tcp and ip4.dstip in self.collectors:
             t_name = self.collectors[ip4.dstip]
             wip = ip4.srcip
@@ -308,7 +292,7 @@ class MLRoutingApp(object):
                 log.info("[%s] WORKER DISCOVERED %s  Kv=%d",
                          t_name.upper(), wip, len(self.active_workers[t_name]))
             self._note_connection(t_name, str(wip), tcp.srcport)
-
+        #se la destinazione non e ancora nota si fa flood
         if dst_mac.is_multicast or dst_mac not in self.mac_to_location:
             self.flood_to_hosts(event)
             return
@@ -357,7 +341,7 @@ class MLRoutingApp(object):
         m2.in_port = in_port
         m2.actions.append(of.ofp_action_output(port=op_first))
         event.connection.send(m2)
-
+    #manda il pacchetto grezzo fuori da ogni porta di ogni switch
     def flood_to_hosts(self, event):
         raw = event.parsed.pack()
         for conn in core.openflow.connections:
@@ -375,6 +359,6 @@ class MLRoutingApp(object):
                     msg.actions.append(of.ofp_action_output(port=p))
                 conn.send(msg)
 
-
+#punto di ingresso del modulo POX
 def launch():
     core.registerNew(MLRoutingApp)
