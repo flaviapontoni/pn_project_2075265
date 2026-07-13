@@ -5,11 +5,11 @@ try:
 except ImportError:
     HAS_PLT = False
 
-# -- global parameters -----------------------------------------------------
+# paramentri globali
 C_LINK    = 100.0    # Mbps   data link capacity
-RTT       = 0.005    # s      simulated RTT (tc netem 0.5ms * 2 hops * 5)
-ALPHA     = 1.5      # TCP window factor
-BASE_PORT = 5000     # base port: w1->5001, w2->5002, ...
+RTT       = 0.005    # RTT simulato (tc netem 0.5ms * 2 hops * 5)
+ALPHA     = 1.5      # fattore di sicurezza sul prodotto banda-ritardo teorico
+BASE_PORT = 5000     # schema porte deterministico: w1->5001, w2->5002, ...
 
 TRAININGS = [
     {"name":"blue",   "senders":["w1","w2","w3","w4","w5","w6","w7","w8","w9","w10"],
@@ -22,7 +22,7 @@ TRAININGS = [
      "collector":"c4","collector_ip":"10.0.1.4","D":125, "T":40,"phi":5,  "cycles":4},
 ]
 
-# -- utilities -------------------------------------------------------------
+# Funzioni di utilità
 def get_container_map():
     r = subprocess.run(["docker","ps","--format","{{.Names}}"],
                        capture_output=True, text=True)
@@ -32,7 +32,7 @@ def get_container_map():
         if len(parts) >= 2:
             m[parts[-2]] = name
     return m
-
+#wrapper centrale per eseguire comandi dentro i container docker
 def docker_exec(node, cmd, cmap, sync=False):
     if node not in cmap:
         print(f"[ERROR] {node} not found in docker ps"); return
@@ -45,9 +45,9 @@ def compute_window_bytes(f_v):
     return int(ALPHA * (f_v * 1e6) * RTT / 8)
 
 def get_worker_port(worker):
-    return BASE_PORT + int(worker[1:])   # w1->5001, w11->5011, ...
+    return BASE_PORT + int(worker[1:])  
 
-# -- server (iperf3 daemon, one port per worker) ---------------------------
+# server iperf3 
 def start_servers(cmap):
     used = set()
     for cfg in TRAININGS:
@@ -59,7 +59,7 @@ def start_servers(cmap):
                             ["iperf3","-s","-D","-p",str(port)], cmap)
                 used.add(port)
 
-# -- client ----------------------------------------------------------------
+# client iperf3
 def start_client(worker, ip, port, D_mbit, f_v, cmap):
     window = compute_window_bytes(f_v)
     nbytes = int(D_mbit * 1e6 / 8)
@@ -68,14 +68,15 @@ def start_client(worker, ip, port, D_mbit, f_v, cmap):
     print(f"[FLOW] {worker} -> {ip}:{port}  D={D_mbit}Mb  rate={f_v:.1f}Mbps")
     docker_exec(worker, ["bash","-c",cmd], cmap)
 
-# -- traffic monitor -------------------------------------------------------
+# monitoraggio del traffico in uscita/ingresso dei container
+#legge dal kernel i byte trasmessi/ricevuti da eth0 e li converte in Mbps
 def get_bytes(node, direction, cmap):
     out = docker_exec(node,
                       ["cat",f"/sys/class/net/eth0/statistics/{direction}_bytes"],
                       cmap, sync=True)
     try: return int(out or 0)
     except: return 0
-
+# gira in un thread dedicato per ogni nodo monitorato
 def monitor(node, direction, logfile, stop, cmap):
     prev = get_bytes(node, direction, cmap)
     t = 0
@@ -88,7 +89,8 @@ def monitor(node, direction, logfile, stop, cmap):
             f.write(f"{t} {mbps:.4f}\n"); f.flush()
             prev = curr; t += 1
 
-# -- training run ----------------------------------------------------------
+# training run 
+#genera incast
 def run_training(cfg, cmap):
     name = cfg["name"]
     print(f"[{name}] waiting phi={cfg['phi']}s before start ...")
@@ -105,7 +107,8 @@ def run_training(cfg, cmap):
         time.sleep(max(0, cfg["T"] - (time.time()-start)))
     print(f"[{name}] DONE")
 
-# -- plots -----------------------------------------------------------------
+#  plots 
+#quattro curve di throughput ricevuto nel tempo, una per training
 def plot_collectors(rx_files):
     plt.figure(figsize=(12,5))
     for label, fname in rx_files.items():
@@ -120,7 +123,7 @@ def plot_collectors(rx_files):
     plt.legend(); plt.grid()
     plt.tight_layout(); plt.savefig("incast_result.png", dpi=120)
     print("Saved: incast_result.png")
-
+#throughput trasmesso da ciascuno dei suoi worker
 def plot_workers(tx_files, training_name):
     workers = [w for cfg in TRAININGS if cfg["name"]==training_name
                for w in cfg["senders"]]
@@ -140,7 +143,7 @@ def plot_workers(tx_files, training_name):
     fname = f"workers_{training_name}.png"
     plt.savefig(fname, dpi=120); print(f"Saved: {fname}")
 
-# -- main ------------------------------------------------------------------
+#  main 
 def main():
     print("\n=== PNET Project 4 — Incast Simulation ===\n")
 
