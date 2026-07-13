@@ -1,0 +1,25 @@
+ip addr add 20.0.1.5/24 dev eth6
+
+tc qdisc add dev eth0 root handle 1: netem delay 0.5ms
+tc qdisc add dev eth0 parent 1: handle 2: tbf rate 100mbit burst 50000 limit 62500
+tc qdisc add dev eth1 root handle 1: netem delay 0.5ms
+tc qdisc add dev eth1 parent 1: handle 2: tbf rate 100mbit burst 50000 limit 62500
+tc qdisc add dev eth2 root handle 1: netem delay 0.5ms
+tc qdisc add dev eth2 parent 1: handle 2: tbf rate 100mbit burst 50000 limit 62500
+tc qdisc add dev eth3 root handle 1: netem delay 0.5ms
+tc qdisc add dev eth3 parent 1: handle 2: tbf rate 100mbit burst 50000 limit 62500
+tc qdisc add dev eth4 root handle 1: netem delay 0.5ms
+tc qdisc add dev eth4 parent 1: handle 2: tbf rate 100mbit burst 50000 limit 62500
+tc qdisc add dev eth5 root handle 1: netem delay 0.5ms
+tc qdisc add dev eth5 parent 1: handle 2: tbf rate 100mbit burst 50000 limit 62500
+
+/usr/share/openvswitch/scripts/ovs-ctl --system-id=random start
+ovs-vsctl add-br l5
+ovs-vsctl add-port l5 eth0
+ovs-vsctl add-port l5 eth1
+ovs-vsctl add-port l5 eth2
+ovs-vsctl add-port l5 eth3
+ovs-vsctl add-port l5 eth4
+ovs-vsctl add-port l5 eth5
+
+ovs-vsctl set-controller l5 tcp:20.0.1.100

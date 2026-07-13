@@ -1,0 +1,7 @@
+ip address add 20.0.1.100/24 dev eth0
+
+chmod +x /pox/pox.py
+pkill -f pox.py 2>/dev/null
+sleep 1
+
+/pox/pox.py samples.pretty_log openflow.discovery ml_routing openflow.of_01 --port=6653 > /var/log/pox.log 2>&1 &
