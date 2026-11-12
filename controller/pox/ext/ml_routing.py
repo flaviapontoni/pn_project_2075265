@@ -260,6 +260,8 @@ class MLRoutingApp(object):
         # auto-risparatore da single se rilevato uno squilibrio
         if congested and self.routing_mode == "single":
             self.routing_mode = "balanced"
+            # azzera i contatori cumulativi: il bilanciamento riparte da zero
+            self.spine_load = {v: defaultdict(int) for v in self.collectors.values()}
             log.warning("[AUTO] congestion detected -> switching ROUTING_MODE "
                         "'single' -> 'balanced'")
 
