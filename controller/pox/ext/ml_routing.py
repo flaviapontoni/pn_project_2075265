@@ -1,24 +1,24 @@
 import time
 from collections import defaultdict
 
-from pox.core import core
-import pox.openflow.libopenflow_01 as of
-from pox.lib.util import dpid_to_str
-from pox.lib.addresses import IPAddr
-from pox.lib.recoco import Timer
+from pox.core import core   #accesso agli eventi e alle connessioni OpenFlow
+import pox.openflow.libopenflow_01 as of  #reazione dei messaggi OpenFlow 1.0, come richieste di statistiche e regole
+from pox.lib.util import dpid_to_str    #rende leggibili nei log gli identificatori degli switch
+from pox.lib.addresses import IPAddr     # rappresenta indirizzi IP nel formato previsto da POX
+from pox.lib.recoco import Timer            #esegue periodicamente una funzione
 
 log = core.getLogger()
 
 POLL_INTERVAL   = 2       # statistiche flusso 
-REPORT_INTERVAL = 20      # distribuzione del carico tra gli spine
+REPORT_INTERVAL = 20      # stampare distribuzione del carico tra gli spine
 IDLE_TIMEOUT    = 10      # terminazione della regola se non ci sono pacchetti per 10s
-HARD_TIMEOUT    = 120     # ultimo byte di un flusso -> termina la regola dopo 120s
-MIN_ROUND_GAP   = 5       # conns con lo stesso sport entro 5s -> stesso round
+HARD_TIMEOUT    = 120     # scadenza massima di una regola
+MIN_ROUND_GAP   = 5       # Distingue un nuovo round da un’altra connessione ravvicinata dello stesso worker
 DV_MIN          = 500000  # ignora le piccole connessioni di controllo/ACK per Dv
 #_report_distribution monitora la divisione dello spine
 # e promuove automaticamente self.routing_mode da "single" -> "balanced"
 ROUTING_MODE    = "single"  #forza ogni flusso su un solo spine (baseline per confronto).
-UNEVEN_RATIO    = 1.25   # max/min spine-load ratio above which we call it "uneven"
+UNEVEN_RATIO    = 1.25   # max/min spine-load ratio 
 
 
 class MLRoutingApp(object):
@@ -29,7 +29,7 @@ class MLRoutingApp(object):
         #topologia switch-switch e switch-host
         self.graph = {}               # dpid -> {neighbor_dpid: out_port}
         self.mac_to_location = {}      # mac  -> (dpid, port)
-        
+        #dizionario statico
         self.collectors = {
             IPAddr("10.0.1.1"): "blue",
             IPAddr("10.0.1.2"): "green",
@@ -37,34 +37,35 @@ class MLRoutingApp(object):
             IPAddr("10.0.1.4"): "yellow",
         }
 
-        # discovery / control state 
-        self.active_workers   = {v: set() for v in self.collectors.values()}
-        self.training_start_t = {v: None  for v in self.collectors.values()}
-        self.spine_load       = {v: defaultdict(int) for v in self.collectors.values()}
-        self.global_start     = None    # tempo in cui il primo worker è stato visto (per calcolare phi_v)
+        #dati per training e routing
+        self.active_workers   = {v: set() for v in self.collectors.values()}  # IP dei worker visti, separati per training
+        self.training_start_t = {v: None  for v in self.collectors.values()}  # primo istante in cui si vede ciascun training
+        self.spine_load       = {v: defaultdict(int) for v in self.collectors.values()}  # conteggio cumulativo dei flussi assegnati a ogni spine
+        self.global_start     = None    # istante del primo worker visto; riferimento per calcolare phi
 
         # reactive routing state 
-        self.routing_mode = ROUTING_MODE   # può cambiare runtime se si rileva congestione
+        self.routing_mode = ROUTING_MODE   # modalità attiva: "single" o "balanced"
 
-        # traffic-characterization state 
-        self.worker_training  = {}               # worker_ip -> nome del training
-        self.conn_seen        = set()            # insieme delle coppie (worker_ip, tcp_src_port) processate almeno una volta
-        self.round_start      = {}               # worker_ip -> timestamp dell'ultimo round iniziato per quel worker
-        self.first_round_start = {}              # worker_ip -> timestamp del primo round, mai più modificato
-        self.round_count      = defaultdict(int) # worker_ip → quanti round ha completato finora quel worker
-        self.Tv_samples       = defaultdict(list) # worker_ip -> [inter-round gaps] lista scarti temporali tra round successivi (per calcolare Tv)
-        self.phi              = {}               # worker_ip -> phase offset
-        self.conn_dpids       = defaultdict(set)  # (wip, sport) -> insieme di dpid degli switch che hanno confermato che quel flusso è ancora vivo
-        self.conn_bytes       = {}                 # (wip, sport) -> byte_count più alto osseravto
+        #dati per analizzare connessioni e round
+        self.worker_training  = {}               # IP worker -> training a cui appartiene
+        self.conn_seen        = set()            # connessioni già rilevate: (IP worker, porta TCP sorgente)
+        self.round_start      = {}               # IP worker -> istante dell'ultimo round rilevato
+        self.first_round_start = {}              # IP worker -> istante del primo round rilevato
+        self.round_count      = defaultdict(int) # IP worker -> round rilevati; parte da 0
+        self.Tv_samples       = defaultdict(list) # IP worker -> intervalli tra round, usati per stimare Tv
+        self.phi              = {}               # IP worker -> ritardo del primo avvio rispetto al primo worker
+        self.conn_dpids       = defaultdict(set)  # connessione -> switch che la segnalano ancora attiva
+        self.conn_bytes       = {}               # connessione -> massimo byte_count osservato sugli switch
 
-        Timer(POLL_INTERVAL,   self._request_stats,       recurring=True)
+        # pooling statistiche e report/aurocorrezione 
+        Timer(POLL_INTERVAL,   self._request_stats,       recurring=True)  
         Timer(REPORT_INTERVAL, self._report_distribution, recurring=True)
         log.info("ML Routing up  |  starting mode=%s", self.routing_mode)
 
      # Contabilità della topologia
     
-    # quando uno switch stabilisce il canale di controllo col controller
-    def _handle_ConnectionUp(self, event):
+    # gestisce la connessione di uno switch e inizializza il suo stato
+    def _handle_ConnectionUp(self, event): # cancella tutte le regole precedenti e inizializza il grafo
         self.graph.setdefault(event.dpid, {})
         msg = of.ofp_flow_mod()
         msg.match = of.ofp_match()
@@ -72,7 +73,7 @@ class MLRoutingApp(object):
         event.connection.send(msg)
         log.info("Switch connected: %s", dpid_to_str(event.dpid))
     #ogni link scoperto aggiorna il grafo in entrambe le direzioni
-    def _handle_LinkEvent(self, event):
+    def _handle_LinkEvent(self, event): # aggiorna self.graph con i link tra switch
         lk = event.link
         if event.added:
             self.graph.setdefault(lk.dpid1, {})[lk.dpid2] = lk.port1
@@ -107,8 +108,8 @@ class MLRoutingApp(object):
                 if nb not in path:
                     queue.append(path + [nb])
         return paths
-
-    def _spine_on_path(self, path):
+    # ritorna il primo spine trovato in un cammino
+    def _spine_on_path(self, path): 
         for n in path:
             if self._is_spine(n):
                 return n
@@ -148,7 +149,7 @@ class MLRoutingApp(object):
         return best[2], best[1]
 
     # Caratterizzazione del traffico 
-    # ogni round di iperf3 apre una connessione TCP nuova
+    # ogni round di iperf3 apre una connessione TCP nuova. riconosce le connessioni e prova a raggrupparle in round
     def _note_connection(self, training, wip, sport):
         """Called on the first packet of a worker->collector flow."""
         key = (wip, sport)
@@ -174,7 +175,7 @@ class MLRoutingApp(object):
         else:
             log.debug("[DBG] %s sport=%d  SAME round (gap=%.3fs < %ds)",
                       wip, sport, now - last, MIN_ROUND_GAP)
-    #richiesta di statistiche di flusso
+    #richiesta di statistiche di flusso. chiede  einterpreta statistiche agli switch
     def _request_stats(self):
         for c in core.openflow.connections:
             c.send(of.ofp_stats_request(body=of.ofp_flow_stats_request()))
@@ -192,14 +193,14 @@ class MLRoutingApp(object):
             wip = str(m.nw_src)
             key = (wip, m.tp_src)
             here.add(key)
-            self.conn_dpids[key].add(dpid)
+            self.conn_dpids[key].add(dpid) #dichiara che questo switch ha visto il flusso solo quando riceve la statistica di flusso
             # aggiorna il byte_count più alto osservato per questo flusso
             if stat.byte_count > self.conn_bytes.get(key, 0):
                 self.conn_bytes[key] = stat.byte_count
             self.worker_training[wip] = self.collectors[m.nw_dst]
 
         # flussi che questo switch segnalava prima ma non più
-        # Only fire "done" when the flow has disappeared from ALL switches that had it.
+        # regola scaduta su questo switch -> aspetta che il flusso è sparito da tutti gli switch che lo avevano visto
         for key in list(self.conn_dpids):
             if dpid not in self.conn_dpids[key]:
                 continue         # questo switch non lo ha mai avuto, salta
@@ -210,7 +211,7 @@ class MLRoutingApp(object):
                 continue         # ancora vivo su almeno un altro switch
             # connessione conclusa (sparito da ogni switch che l'aveva)
             dv = self.conn_bytes.pop(key, 0)
-            del self.conn_dpids[key]
+            del self.conn_dpids[key] #insieme di swich che avevano visto il flusso, ora vuoto
             if dv < DV_MIN:
                 continue
             wip, _sport = key
@@ -233,7 +234,7 @@ class MLRoutingApp(object):
                      "%.1fs" % Tv if Tv else "?",
                      self.phi.get(wip, 0.0),
                      rc)
-    
+    # iassume i contatori e può cambiare la modalità di routing
     def _report_distribution(self):
         congested = False
         for t, load in self.spine_load.items():
@@ -263,6 +264,7 @@ class MLRoutingApp(object):
                         "'single' -> 'balanced'")
 
     # Forwarding
+    #gestisce il pacchetto iniziale, sceglie il percorso e installa le regole
     #MAC learning passivo
     def _handle_PacketIn(self, event):
         pkt = event.parsed
@@ -306,7 +308,7 @@ class MLRoutingApp(object):
         if path is None:
             self.flood_to_hosts(event)
             return
-
+        #instradmento proattivo sull'interno del cammino scatenato da un evento reattivo
         if is_incast and spine is not None:
             self.spine_load[training][spine] += 1
             log.info("[%s] flow %s via spine %s  (load: %s)",
@@ -334,7 +336,7 @@ class MLRoutingApp(object):
             conn = core.openflow.getConnection(node)
             if conn:
                 conn.send(msg)
-
+        #il pacchetto in ingresso viene inoltrato al primo switch del cammino
         op_first = dst_port if dpid == dst_dpid else self.graph[dpid][path[1]]
         m2 = of.ofp_packet_out()
         m2.data = event.ofp
@@ -359,6 +361,6 @@ class MLRoutingApp(object):
                     msg.actions.append(of.ofp_action_output(port=p))
                 conn.send(msg)
 
-#punto di ingresso del modulo POX
+#punto di ingresso del modulo POX per registarre la classe
 def launch():
     core.registerNew(MLRoutingApp)

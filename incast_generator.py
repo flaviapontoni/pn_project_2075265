@@ -7,7 +7,7 @@ except ImportError:
 
 # paramentri globali
 C_LINK    = 100.0    # Mbps   data link capacity
-RTT       = 0.005    # RTT simulato (tc netem 0.5ms * 2 hops * 5)
+RTT       = 0.005    # RTT simulato, usato per la dimensione TCP
 ALPHA     = 1.5      # fattore di sicurezza sul prodotto banda-ritardo teorico
 BASE_PORT = 5000     # schema porte deterministico: w1->5001, w2->5002, ...
 
@@ -23,6 +23,7 @@ TRAININGS = [
 ]
 
 # Funzioni di utilità
+#interroga docker ps e costruisce un dizionario {nome_nodo: nome_container}
 def get_container_map():
     r = subprocess.run(["docker","ps","--format","{{.Names}}"],
                        capture_output=True, text=True)
@@ -40,7 +41,7 @@ def docker_exec(node, cmd, cmap, sync=False):
     if sync:
         return subprocess.run(full, capture_output=True, text=True).stdout.strip()
     subprocess.Popen(full)
-
+#foròmula banda-ritardo per calcolare la dimensione della finestra TCP in byte
 def compute_window_bytes(f_v):
     return int(ALPHA * (f_v * 1e6) * RTT / 8)
 
@@ -48,6 +49,7 @@ def get_worker_port(worker):
     return BASE_PORT + int(worker[1:])  
 
 # server iperf3 
+#ogni collector ha tanti server iperf3 quanti sono i suoi worker, ognuno su una porta diversa
 def start_servers(cmap):
     used = set()
     for cfg in TRAININGS:
@@ -64,7 +66,7 @@ def start_client(worker, ip, port, D_mbit, f_v, cmap):
     window = compute_window_bytes(f_v)
     nbytes = int(D_mbit * 1e6 / 8)
     cmd = (f"iperf3 -c {ip} -p {port} -n {nbytes} -w {window} "
-           f"--set-mss 1460 --no-delay > /dev/null 2>&1 &")
+           f"--set-mss 1460 --no-delay > /dev/null 2>&1 &") #limita le dimensioni del segmento e disabilita il Nagle algorithm per ridurre la latenza
     print(f"[FLOW] {worker} -> {ip}:{port}  D={D_mbit}Mb  rate={f_v:.1f}Mbps")
     docker_exec(worker, ["bash","-c",cmd], cmap)
 
@@ -145,9 +147,9 @@ def plot_workers(tx_files, training_name):
 
 #  main 
 def main():
-    print("\n=== PNET Project 4 — Incast Simulation ===\n")
-
-    cmap = get_container_map()
+    print("\n=== PNET Project — Incast Simulation ===\n")
+    #mappa container
+    cmap = get_container_map() 
     print("Container map:")
     for k,v in sorted(cmap.items()): print(f"  {k} -> {v}")
 
@@ -182,7 +184,7 @@ def main():
     for t in threads: t.join()
 
     stop.set()
-    for t in monitors: t.join()  # wait for each monitor to flush its last sample
+    for t in monitors: t.join()  # ferma e attende i monitor
 
     print("\n=== DONE ===\n")
 

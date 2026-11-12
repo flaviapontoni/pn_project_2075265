@@ -11,3 +11,6 @@ RUN apt-get update && \
     git clone --depth 1 https://github.com/noxrepo/pox.git /pox
 
 WORKDIR /pox
+
+#inattivo finchè non si collega al build e alla configurazione della topologia 
+#serve se si vuole costruire una mia immagine del controller.

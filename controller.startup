@@ -1,3 +1,4 @@
+#unica interfaccia del controller
 ip address add 20.0.1.100/24 dev eth0
 
 chmod +x /pox/pox.py
